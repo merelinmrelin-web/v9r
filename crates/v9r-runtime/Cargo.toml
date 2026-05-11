@@ -1,0 +1,21 @@
+[package]
+name = "v9r-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+v9r-core = { workspace = true }
+v9r-cap = { workspace = true }
+v9r-vfs = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+wat = { workspace = true }

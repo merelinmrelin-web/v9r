@@ -1,0 +1,10 @@
+[workspace]
+
+[package]
+name = "task-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
+v9r-core = { path = "../../crates/v9r-core" }

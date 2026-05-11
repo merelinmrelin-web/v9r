@@ -1,0 +1,18 @@
+# Standalone workspace so the wasm32-wasip1 build doesn't fight with the
+# main v9r workspace's host-target settings.
+[workspace]
+
+[package]
+name = "hello-agent"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

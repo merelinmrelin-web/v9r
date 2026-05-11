@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/v9r-core",
+    "crates/v9r-vfs",
+    "crates/v9r-cap",
+    "crates/v9r-runtime",
+    "crates/v9r-orchestrator",
+    "crates/v9r-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["v9r contributors"]
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "io-util", "io-std", "time", "fs", "process"] }
+async-trait = "0.1"
+bytes = "1.7"
+slotmap = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+bincode = "1.3"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wasmtime = "26"
+wasmtime-wasi = "26"
+wat = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+rustyline = { version = "=14.0.0", default-features = false }
+colored = "2.1"
+
+v9r-core = { path = "crates/v9r-core" }
+v9r-vfs = { path = "crates/v9r-vfs" }
+v9r-cap = { path = "crates/v9r-cap" }
+v9r-runtime = { path = "crates/v9r-runtime" }
+v9r-orchestrator = { path = "crates/v9r-orchestrator" }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"

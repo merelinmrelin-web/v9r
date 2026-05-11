@@ -1,0 +1,12 @@
+[package]
+name = "v9r-vfs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+v9r-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+slotmap = { workspace = true }
+tracing = { workspace = true }

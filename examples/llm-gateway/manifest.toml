@@ -1,0 +1,18 @@
+[agent]
+name = "llm_gateway"
+trust = "system"
+module = "llm_gateway.wasm"
+
+[[mounts]]
+virtual = "/"
+real = "/agents/llm_gateway"
+mode = "rw"
+
+[[mounts]]
+virtual = "/log"
+real = "/agents/llm_gateway/log"
+mode = "rw"
+
+[[triggers]]
+path = "input"
+export = "on_input"
