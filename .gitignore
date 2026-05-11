@@ -4,3 +4,8 @@ trace.log
 *.bundle
 .env
 .DS_Store
+target/
+*.jsonl
+task.txt
+.v9r-workdir
+.v9r/
