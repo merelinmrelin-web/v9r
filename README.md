@@ -24,6 +24,15 @@ It treats every task as a transaction over a filesystem:
 
 No partial success. No silent state drift. No unbounded execution.
 
+## Installation
+
+To use `v9r` as a global command, install it via Cargo:
+
+```bash
+git clone [https://github.com/merelinmrelin-web/v9r](https://github.com/merelinmrelin-web/v9r)
+cd v9r
+cargo install --path crates/v9r-cli
+
 ## Quick Start
 
 Build:
