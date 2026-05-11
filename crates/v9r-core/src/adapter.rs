@@ -1,11 +1,12 @@
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::time::Instant;
+use uuid::Uuid;
 
 use crate::bundle::{compute_mandatory_artifact_hashes, ArtifactHash};
 use crate::execution::{run_task_step, CommandSpec, ExecutionError};
@@ -26,8 +27,14 @@ pub const SYSTEM_PROMPT: &str = r#"You are operating inside v9r, a task-centric 
 You must respond only with XML action tags, optionally followed by short text inside <finish>.
 
 Allowed actions:
-<execute>shell command</execute>
-Run a command. The runtime executes commands sequentially and checks the task manifest first.
+<execute>program arg1 arg2 ...</execute>
+Run a command. The runtime spawns the program DIRECTLY via execve — there is no
+shell. So:
+  - No pipes, redirects, command substitution, globs, `;`, `&&`, `||`, `$VAR`, `~`.
+  - Use double quotes ("...") only for args that contain literal spaces.
+  - Paths must be relative to the workdir. Absolute paths and `..` are refused.
+  - Shell interpreters (sh, bash, zsh, dash, …) are denied unconditionally.
+The runtime executes commands sequentially and checks the task manifest first.
 
 <write path="relative/or/absolute/path">file content</write>
 Write file content. Paths outside allow_write are violations.
@@ -412,7 +419,13 @@ impl Task {
         for action in actions {
             match action {
                 LlmAction::Execute(command) => {
-                    run_task_step(self, shell_command(command), trace).await?;
+                    // Direct execve, no shell. `parse_action_command` builds
+                    // a (program, args) tuple from the LLM payload using
+                    // whitespace tokenization with simple "…" quoting.
+                    // The runtime then validates this via
+                    // `validate_command_spec` BEFORE spawning.
+                    let spec = parse_action_command(&command)?;
+                    run_task_step(self, spec, trace).await?;
                     if !matches!(self.status, TaskStatus::Violation) {
                         self.status = TaskStatus::Running;
                     }
@@ -605,33 +618,36 @@ async fn apply_write(
     task.record_tool_call()
         .map_err(|_| AdapterError::MaxStepsExceeded(task.manifest.max_steps))?;
     vfs::ensure_task_fs_unblocked(task.id)?;
-    let path = resolve_task_path(&task.workdir, &path);
-    let allowed = task.manifest.is_allowed(&path, AccessType::Write);
+
+    // Layer 1: lexical fence on the LLM-supplied path. Rejects absolute
+    // paths, `~/...`, `..` components, and lexical escapes when joined
+    // to the workdir.
+    let resolved = match validate_action_path(&task.workdir, &path) {
+        Ok(p) => p,
+        Err(reason) => return deny_write_action(task, trace, reason).await,
+    };
+
+    // Layer 2: per-task manifest allowlist on the lexical, workdir-relative path.
+    let allowed = task.manifest.is_allowed(&resolved, AccessType::Write);
     trace
         .log_event(TaskEvent::FileAccess {
-            path: path.clone(),
+            path: resolved.clone(),
             access: AccessType::Write,
             allowed,
         })
         .await?;
     if !allowed {
-        task.status = TaskStatus::Violation;
-        let reason = format!("write denied: {}", path.display());
-        trace
-            .log_event(TaskEvent::ViolationOccurred {
-                reason: reason.clone(),
-            })
-            .await?;
-        vfs::block_task_fs(task.id);
-        trace
-            .log_event(TaskEvent::TaskFinished {
-                status: TaskStatus::Violation,
-            })
-            .await?;
-        return Err(AdapterError::Violation(reason));
+        return deny_write_action(
+            task,
+            trace,
+            format!("write denied: {}", resolved.display()),
+        )
+        .await;
     }
 
-    if let Some(parent) = path
+    // Ensure the parent directory exists. We do this BEFORE the symlink
+    // fence so canonicalize() has something to resolve.
+    if let Some(parent) = resolved
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
@@ -642,20 +658,222 @@ async fn apply_write(
                 source,
             })?;
     }
-    tokio::fs::write(&path, content)
+
+    // Layer 3: symlink fence. The lexical check rules out `..` and root,
+    // but a *workdir-internal* symlink could still point outside the
+    // workdir (e.g. `workdir/legit -> /etc`). Canonicalize the parent of
+    // the destination and the workdir, and require the parent to live
+    // under the canonicalized workdir.
+    let parent_for_real = resolved.parent().unwrap_or_else(|| Path::new("."));
+    let parent_real =
+        tokio::fs::canonicalize(parent_for_real)
+            .await
+            .map_err(|source| AdapterError::Io {
+                path: parent_for_real.to_path_buf(),
+                source,
+            })?;
+    let workdir_real =
+        tokio::fs::canonicalize(&task.workdir)
+            .await
+            .map_err(|source| AdapterError::Io {
+                path: task.workdir.clone(),
+                source,
+            })?;
+    if !parent_real.starts_with(&workdir_real) {
+        return deny_write_action(
+            task,
+            trace,
+            format!(
+                "write path escapes workdir via symlink: {} -> {}",
+                resolved.display(),
+                parent_real.display()
+            ),
+        )
+        .await;
+    }
+
+    // Atomic write: tempfile in the same directory, then rename. `rename`
+    // within a single filesystem on POSIX is atomic, so a crash mid-write
+    // leaves the destination either fully-old or fully-new — never half.
+    let file_name = resolved.file_name().ok_or_else(|| {
+        AdapterError::InvalidAction(format!(
+            "write destination has no file name: {}",
+            resolved.display()
+        ))
+    })?;
+    let dst_in_real_parent = parent_real.join(file_name);
+    write_atomic_to(&dst_in_real_parent, content.as_bytes())
         .await
-        .map_err(|source| AdapterError::Io { path, source })?;
+        .map_err(|source| AdapterError::Io {
+            path: dst_in_real_parent.clone(),
+            source,
+        })?;
     Ok(())
 }
 
-fn shell_command(command: String) -> CommandSpec {
-    CommandSpec {
-        program: "sh".to_string(),
-        args: vec!["-c".to_string(), command],
+/// Strict path fence for LLM-supplied action paths. Mirrors the
+/// argument validator in `execution.rs` but is stricter: every input
+/// here IS a path, so we don't have flag-style exemptions.
+///
+/// Returns the workdir-joined, lexically-normalized destination on
+/// success. The caller is responsible for the symlink fence afterwards.
+pub(crate) fn validate_action_path(
+    workdir: &Path,
+    raw: &Path,
+) -> std::result::Result<PathBuf, String> {
+    let s = raw.to_string_lossy();
+    if s.is_empty() {
+        return Err("action path is empty".to_string());
+    }
+    if raw.is_absolute() || s.starts_with('/') || s.starts_with('\\') {
+        return Err(format!("action path is absolute: {s}"));
+    }
+    if s.starts_with('~') {
+        return Err(format!("action path is home-relative: {s}"));
+    }
+    // Reject any non-Normal/CurDir component. This catches `..`
+    // wherever it appears (leading, embedded, trailing) and Prefix
+    // (Windows drive letters) and RootDir.
+    for c in raw.components() {
+        match c {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!("action path contains parent-dir component: {s}"));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("action path is absolute: {s}"));
+            }
+        }
+    }
+
+    // Belt-and-suspenders: after joining, verify lexical containment.
+    // The component check above already guarantees this, but the explicit
+    // assertion makes the invariant visible and survives future edits.
+    let workdir_norm = normalize_path(workdir);
+    let joined = normalize_path(&workdir.join(raw));
+    if !joined.starts_with(&workdir_norm) {
+        return Err(format!("action path escapes workdir: {s}"));
+    }
+    Ok(joined)
+}
+
+/// Atomic write: temp file in the same directory, then rename to `dst`.
+/// Same-directory rename is atomic on POSIX, so a crash mid-write leaves
+/// the destination either fully-old or fully-new.
+pub(crate) async fn write_atomic_to(dst: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = dst.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
+    })?;
+    let tmp = parent.join(format!(
+        ".{}.v9r-tmp-{}",
+        file_name.to_string_lossy(),
+        Uuid::new_v4()
+    ));
+
+    // Write payload to temp file. On error, best-effort cleanup.
+    if let Err(e) = tokio::fs::write(&tmp, content).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    // Atomic move into place. On error, best-effort cleanup.
+    if let Err(e) = tokio::fs::rename(&tmp, dst).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Record a write-action violation: status, trace, fs block, finish event.
+/// Returns the corresponding `AdapterError::Violation` for the caller to
+/// propagate. `is_security_violation` then routes this to rollback.
+async fn deny_write_action(
+    task: &mut Task,
+    trace: &TraceLogger,
+    reason: String,
+) -> Result<()> {
+    task.status = TaskStatus::Violation;
+    trace
+        .log_event(TaskEvent::ViolationOccurred {
+            reason: reason.clone(),
+        })
+        .await?;
+    vfs::block_task_fs(task.id);
+    trace
+        .log_event(TaskEvent::TaskFinished {
+            status: TaskStatus::Violation,
+        })
+        .await?;
+    Err(AdapterError::Violation(reason))
+}
+
+/// Parse the body of an `<execute>…</execute>` into a `CommandSpec`.
+///
+/// **No shell.** The payload is tokenized by whitespace with simple
+/// `"…"` quoting for tokens that contain spaces. Backslash escapes are
+/// rejected. Unquoted shell metacharacters (`;`, `&`, `|`, `$`, …) are
+/// passed through as literal argv bytes — they're inert without a
+/// shell, and `execution::validate_command_spec` is the final fence.
+pub(crate) fn parse_action_command(command: &str) -> Result<CommandSpec> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err(AdapterError::InvalidAction(
+            "<execute> body is empty".to_string(),
+        ));
+    }
+    let tokens = tokenize_command(command)?;
+    let mut iter = tokens.into_iter();
+    let program = iter.next().ok_or_else(|| {
+        AdapterError::InvalidAction("<execute> body has no program token".to_string())
+    })?;
+    Ok(CommandSpec {
+        program,
+        args: iter.collect(),
         cwd: None,
         reads: Vec::new(),
         writes: Vec::new(),
+    })
+}
+
+fn tokenize_command(command: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut had_quoted = false;
+    for c in command.chars() {
+        match c {
+            '\\' => {
+                return Err(AdapterError::InvalidAction(
+                    "backslash escapes are not supported in <execute> payloads".to_string(),
+                ));
+            }
+            '\n' | '\r' | '\0' => {
+                return Err(AdapterError::InvalidAction(format!(
+                    "control character {c:?} in <execute> payload"
+                )));
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                had_quoted = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() || had_quoted {
+                    out.push(std::mem::take(&mut cur));
+                    had_quoted = false;
+                }
+            }
+            c => cur.push(c),
+        }
     }
+    if in_quotes {
+        return Err(AdapterError::InvalidAction(
+            "unmatched double quote in <execute> payload".to_string(),
+        ));
+    }
+    if !cur.is_empty() || had_quoted {
+        out.push(cur);
+    }
+    Ok(out)
 }
 
 fn resolve_task_path(workdir: &Path, path: &Path) -> PathBuf {
@@ -720,5 +938,182 @@ mod tests {
     fn rejects_unknown_finish_status() {
         let err = parse_actions(r#"<finish status="Done">no</finish>"#).unwrap_err();
         assert!(err.to_string().contains("unsupported finish status"));
+    }
+
+    #[test]
+    fn parse_action_command_basic() {
+        let s = parse_action_command("cargo test").unwrap();
+        assert_eq!(s.program, "cargo");
+        assert_eq!(s.args, vec!["test"]);
+    }
+
+    #[test]
+    fn parse_action_command_handles_quoted_arg_with_spaces() {
+        let s = parse_action_command(r#"git commit -m "fix: foo bar""#).unwrap();
+        assert_eq!(s.program, "git");
+        assert_eq!(s.args, vec!["commit", "-m", "fix: foo bar"]);
+    }
+
+    #[test]
+    fn parse_action_command_preserves_empty_quoted_arg() {
+        let s = parse_action_command(r#"echo "" tail"#).unwrap();
+        assert_eq!(s.program, "echo");
+        assert_eq!(s.args, vec!["", "tail"]);
+    }
+
+    #[test]
+    fn parse_action_command_rejects_backslash() {
+        let err = parse_action_command(r#"git commit -m \"x\""#).unwrap_err();
+        assert!(err.to_string().contains("backslash"));
+    }
+
+    #[test]
+    fn parse_action_command_rejects_newline() {
+        let err = parse_action_command("cargo test\nrm -rf .").unwrap_err();
+        assert!(err.to_string().contains("control character"));
+    }
+
+    #[test]
+    fn parse_action_command_rejects_empty_and_whitespace() {
+        assert!(parse_action_command("").is_err());
+        assert!(parse_action_command("   \t  ").is_err());
+    }
+
+    #[test]
+    fn parse_action_command_rejects_unmatched_quote() {
+        assert!(parse_action_command(r#"echo "unterminated"#).is_err());
+    }
+
+    #[test]
+    fn parse_action_command_tokenizes_shell_meta_as_literals() {
+        // No shell: `;` is just a literal argv byte. The validator below
+        // (validate_command_spec) won't reject `;` itself — it's the
+        // execve guarantee that makes this safe, since `cargo` will get
+        // the `;` as an argument and either reject or ignore it; no
+        // second command runs.
+        let s = parse_action_command("cargo test ; rm -rf .").unwrap();
+        assert_eq!(s.program, "cargo");
+        assert_eq!(s.args, vec!["test", ";", "rm", "-rf", "."]);
+    }
+
+    /// End-to-end: the user's reported "rm -rf .` smuggled via `sh -c`"
+    /// class is rejected at the runtime validator after parsing.
+    #[test]
+    fn shell_smuggling_is_rejected_by_runtime_validator() {
+        use crate::execution::validate_command_spec;
+
+        let spec = parse_action_command(r#"sh -c "rm -rf .""#).unwrap();
+        // Parse succeeds — `sh` is just a token. The denial is at
+        // validation time, which is the layer the manifest cannot
+        // override.
+        let err = validate_command_spec(&spec).unwrap_err();
+        assert!(err.contains("shell interpreters"));
+    }
+
+    // -------- validate_action_path --------
+
+    fn workdir() -> PathBuf {
+        // A stable workdir for path-shape tests. Doesn't have to exist
+        // — the lexical check is purely string ops.
+        PathBuf::from("/tmp/v9r-fake-workdir")
+    }
+
+    #[test]
+    fn validate_action_path_accepts_relative() {
+        let p = validate_action_path(&workdir(), Path::new("src/main.rs")).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/v9r-fake-workdir/src/main.rs"));
+    }
+
+    #[test]
+    fn validate_action_path_accepts_curdir_components() {
+        // Component::CurDir is the lone "." — harmless and used by some tools.
+        let p = validate_action_path(&workdir(), Path::new("./src/./main.rs")).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/v9r-fake-workdir/src/main.rs"));
+    }
+
+    #[test]
+    fn validate_action_path_rejects_absolute() {
+        for bad in ["/etc/passwd", "/", "\\Windows\\System32"] {
+            let err = validate_action_path(&workdir(), Path::new(bad)).unwrap_err();
+            assert!(err.contains("absolute"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_action_path_rejects_home_relative() {
+        for bad in ["~/secret", "~"] {
+            let err = validate_action_path(&workdir(), Path::new(bad)).unwrap_err();
+            assert!(err.contains("home-relative"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_action_path_rejects_parent_dir_anywhere() {
+        for bad in [
+            "..",
+            "../escape",
+            "src/../../../etc",
+            "foo/../bar",
+            "foo/..",
+        ] {
+            let err = validate_action_path(&workdir(), Path::new(bad)).unwrap_err();
+            assert!(err.contains("parent-dir"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_action_path_rejects_empty() {
+        let err = validate_action_path(&workdir(), Path::new("")).unwrap_err();
+        assert!(err.contains("empty"));
+    }
+
+    // -------- write_atomic_to --------
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("v9r-adapter-test-{name}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn write_atomic_writes_new_file() {
+        let dir = temp_dir("new");
+        let dst = dir.join("hello.txt");
+        write_atomic_to(&dst, b"hi").await.unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hi");
+        // No stale temp file left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("v9r-tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "stale temp file(s): {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn write_atomic_replaces_existing_file_atomically() {
+        let dir = temp_dir("replace");
+        let dst = dir.join("data.txt");
+        std::fs::write(&dst, b"old content").unwrap();
+        write_atomic_to(&dst, b"new content").await.unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new content");
+    }
+
+    #[tokio::test]
+    async fn write_atomic_cleans_tmp_on_rename_failure() {
+        // Hard to force rename to fail portably. Instead, sanity-check
+        // that a successful round trip never leaves *.v9r-tmp-* files.
+        let dir = temp_dir("cleanup");
+        let dst = dir.join("nested/inside/file.txt");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        for _ in 0..5 {
+            write_atomic_to(&dst, b"x").await.unwrap();
+        }
+        let n_tmp = std::fs::read_dir(dst.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".v9r-tmp-"))
+            .count();
+        assert_eq!(n_tmp, 0);
     }
 }

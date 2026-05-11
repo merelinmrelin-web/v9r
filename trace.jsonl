@@ -1,0 +1,1 @@
+{"TaskStarted":{"timestamp":"2026-05-11T18:33:14.846908Z","manifest":{"allow_read":["/Users/nikita/v9r"],"allow_write":["/Users/nikita/v9r"],"allow_exec":["sh","cargo"],"token_limit":4096,"max_steps":16,"timeout_ms":30000,"mandatory_artifacts":["/Users/nikita/v9r/result.txt"],"test_commands":["cargo test"]}}}

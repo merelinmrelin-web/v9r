@@ -12,7 +12,30 @@ use crate::trace::{TaskEvent, TraceLogger};
 const V9R_DIR: &str = ".v9r";
 const BACKUPS_DIR: &str = "backups";
 const SNAPSHOT_MANIFEST: &str = "manifest.json";
-const SAFETY_ERROR: &str = "Safety Error: Cannot use a project root as a mutable workdir. Please use a subfolder or a temporary directory.";
+const SAFETY_ERROR: &str = "Safety Error: Cannot use a project root (or a subfolder of one) as a mutable workdir. Place the workdir somewhere outside any version-controlled tree, or opt in by creating a `.v9r-workdir` file inside it.";
+
+/// Files/dirs that mark `dir` as a project root. `.git` is checked by
+/// presence, not type, so it catches both worktrees (`.git/` dir) and
+/// submodules / linked-worktrees (`.git` file).
+const PROJECT_MARKERS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "Cargo.toml",
+    "Cargo.lock",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+];
+
+/// Presence of this file at the workdir's top level means the user has
+/// explicitly opted in: "yes, manage this directory as an agent workdir,
+/// even though an ancestor is a project root." Without it we refuse to
+/// rollback inside any version-controlled tree.
+const OPT_IN_MARKER: &str = ".v9r-workdir";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CheckpointId(pub Uuid);
@@ -71,8 +94,37 @@ pub fn register_task(task_id: Uuid, workdir: PathBuf) {
         });
 }
 
+fn has_marker_at(dir: &Path) -> bool {
+    PROJECT_MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
+fn ancestor_has_marker(dir: &Path) -> bool {
+    let mut cur = dir.parent();
+    while let Some(p) = cur {
+        if has_marker_at(p) {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+/// A directory is safe to use as a mutable agent workdir when:
+///   1. It does NOT itself contain a project-root marker (.git, Cargo.toml, etc.)
+///   2. AND either no ancestor contains a marker, OR the workdir contains
+///      the explicit opt-in file `.v9r-workdir`.
+///
+/// Rule (2) is the one that catches the "agent is rooted at a subfolder
+/// inside my git repo" footgun. The opt-in is a file the user creates
+/// when they really do want the agent operating inside their repo.
 pub fn is_safe_directory(workdir: &Path) -> bool {
-    !(workdir.join(".git").is_dir() || workdir.join("Cargo.toml").is_file())
+    if has_marker_at(workdir) {
+        return false;
+    }
+    if workdir.join(OPT_IN_MARKER).is_file() {
+        return true;
+    }
+    !ancestor_has_marker(workdir)
 }
 
 pub fn ensure_safe_directory(workdir: &Path) -> Result<()> {
@@ -81,6 +133,32 @@ pub fn ensure_safe_directory(workdir: &Path) -> Result<()> {
     } else {
         Err(TransactionError::Safety(SAFETY_ERROR.to_string()))
     }
+}
+
+/// Reject relative paths read out of an on-disk snapshot manifest that
+/// contain anything other than ordinary segments — no `..`, no `/foo`
+/// absolute paths, no `.`. The manifest is regenerated each checkpoint,
+/// but it lives on disk between checkpoint and rollback, so this is a
+/// hardening against tampering or corruption.
+fn safe_relative_path(rel: &Path) -> Result<()> {
+    use std::path::Component;
+    if rel.as_os_str().is_empty() {
+        return Err(TransactionError::Safety(
+            "snapshot manifest contained an empty path".to_string(),
+        ));
+    }
+    for c in rel.components() {
+        match c {
+            Component::Normal(_) => continue,
+            other => {
+                return Err(TransactionError::Safety(format!(
+                    "snapshot manifest path is not relative-normal: {other:?} in {}",
+                    rel.display()
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn block_task_fs(task_id: Uuid) {
@@ -146,6 +224,15 @@ fn checkpoint_untraced(task_id: Uuid) -> Result<CheckpointId> {
 
 fn rollback_untraced(task_id: Uuid, checkpoint: CheckpointId) -> Result<()> {
     let workdir = registered_workdir(task_id, false)?;
+
+    // Defense-in-depth. `checkpoint_untraced` validated at snapshot time,
+    // but the directory could have grown a project marker since then
+    // (e.g. `git init` ran inside the workdir during the task). Re-check
+    // before we touch anything. Idempotency note: calling rollback twice
+    // is safe because the second call sees the workdir already restored
+    // and `selective_rollback` becomes a no-op diff.
+    ensure_safe_directory(&workdir)?;
+
     let backup_dir = backup_dir(&workdir, task_id, checkpoint);
     if !backup_dir.is_dir() {
         return Err(TransactionError::Io {
@@ -266,6 +353,15 @@ fn selective_rollback(
     backup_dir: &Path,
     manifest: &SnapshotManifest,
 ) -> Result<()> {
+    // Validate every relative path in the manifest BEFORE any join, so a
+    // tampered manifest can't smuggle `..` into a delete-or-restore path.
+    for file in &manifest.files {
+        safe_relative_path(&file.relative_path)?;
+    }
+    for dir in &manifest.dirs {
+        safe_relative_path(dir)?;
+    }
+
     let original_files: HashSet<PathBuf> = manifest
         .files
         .iter()
@@ -277,6 +373,9 @@ fn selective_rollback(
     collect_current_entries(workdir, workdir, &mut current_files, &mut current_dirs)?;
 
     for relative_path in &current_files {
+        // `current_files` came from `collect_current_entries` which already
+        // strip-prefixes against `workdir`. Belt-and-suspenders: re-validate.
+        safe_relative_path(relative_path)?;
         let path = workdir.join(relative_path);
         if !original_files.contains(relative_path) {
             remove_file_if_exists(&path)?;
@@ -307,8 +406,12 @@ fn selective_rollback(
 
     current_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for relative_path in current_dirs {
+        safe_relative_path(&relative_path)?;
         if !original_dirs.contains(&relative_path) {
             let path = workdir.join(relative_path);
+            // `fs::remove_dir` (not `remove_dir_all`) — only succeeds on
+            // empty dirs, so a non-empty dir we don't know about is left
+            // alone rather than recursively wiped.
             let _ = fs::remove_dir(&path);
         }
     }
@@ -478,5 +581,103 @@ mod tests {
         assert!(!dir.join("new-dir/file.txt").exists());
         assert!(dir.join("stable-dir").exists());
         assert!(dir.exists());
+    }
+
+    #[test]
+    fn rejects_submodule_dot_git_file() {
+        // git submodules and linked worktrees have `.git` as a regular
+        // file ("gitdir: ..."), not a directory. The old check missed this.
+        let dir = temp_dir("submodule");
+        fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/modules/x\n").unwrap();
+        assert!(!is_safe_directory(&dir));
+    }
+
+    #[test]
+    fn rejects_node_pyproject_go_projects() {
+        for marker in ["package.json", "pyproject.toml", "go.mod"] {
+            let dir = temp_dir(&format!("eco-{marker}"));
+            fs::write(dir.join(marker), b"x").unwrap();
+            assert!(!is_safe_directory(&dir), "{marker} should mark a root");
+        }
+    }
+
+    #[test]
+    fn rejects_subfolder_of_git_repo_unless_opted_in() {
+        // Simulate a git repo with an "agent-data" subfolder.
+        let repo = temp_dir("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let agent_dir = repo.join("agent-data");
+        fs::create_dir_all(&agent_dir).unwrap();
+
+        // Default: rejected because an ancestor has `.git/`.
+        assert!(!is_safe_directory(&agent_dir));
+
+        // Opt-in via marker file: now accepted.
+        fs::write(agent_dir.join(OPT_IN_MARKER), b"").unwrap();
+        assert!(is_safe_directory(&agent_dir));
+    }
+
+    #[test]
+    fn rollback_is_idempotent() {
+        let dir = temp_dir("idempotent");
+        let task_id = Uuid::new_v4();
+        register_task(task_id, dir.clone());
+        fs::write(dir.join("a.txt"), "v1\n").unwrap();
+
+        let checkpoint = checkpoint_untraced(task_id).unwrap();
+        fs::write(dir.join("a.txt"), "v2\n").unwrap();
+        fs::write(dir.join("b.txt"), "added\n").unwrap();
+
+        rollback_untraced(task_id, checkpoint).unwrap();
+        // A second rollback must be a no-op, not an error.
+        rollback_untraced(task_id, checkpoint).unwrap();
+        rollback_untraced(task_id, checkpoint).unwrap();
+
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "v1\n");
+        assert!(!dir.join("b.txt").exists());
+    }
+
+    #[test]
+    fn rollback_refuses_if_workdir_became_project_root() {
+        // If a `git init` (or similar) happens inside the workdir between
+        // checkpoint and rollback, refuse to rollback. Otherwise we'd
+        // happily delete the brand-new `.git/` as "files not in snapshot."
+        let dir = temp_dir("post-checkpoint-git");
+        let task_id = Uuid::new_v4();
+        register_task(task_id, dir.clone());
+        fs::write(dir.join("file.txt"), "x").unwrap();
+        let checkpoint = checkpoint_untraced(task_id).unwrap();
+
+        // Simulate `git init` happening after checkpoint.
+        fs::create_dir_all(dir.join(".git")).unwrap();
+
+        let err = rollback_untraced(task_id, checkpoint).unwrap_err();
+        assert!(matches!(err, TransactionError::Safety(_)));
+        // And critically: the `.git` we just created is still there.
+        assert!(dir.join(".git").exists());
+    }
+
+    #[test]
+    fn rollback_rejects_tampered_manifest_with_dotdot() {
+        let dir = temp_dir("tampered");
+        let task_id = Uuid::new_v4();
+        register_task(task_id, dir.clone());
+        fs::write(dir.join("x.txt"), "x").unwrap();
+        let checkpoint = checkpoint_untraced(task_id).unwrap();
+
+        // Forge a manifest with a `..` path.
+        let backup = backup_dir(&dir, task_id, checkpoint);
+        let bad = SnapshotManifest {
+            files: vec![SnapshotFile {
+                relative_path: PathBuf::from("../escape.txt"),
+                bytes: 0,
+                fnv64: 0,
+            }],
+            dirs: Vec::new(),
+        };
+        write_snapshot_manifest(&backup, &bad).unwrap();
+
+        let err = rollback_untraced(task_id, checkpoint).unwrap_err();
+        assert!(matches!(err, TransactionError::Safety(_)));
     }
 }
