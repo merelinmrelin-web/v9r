@@ -1,0 +1,10 @@
+allow_read = ["."]
+allow_write = ["."]
+allow_exec = ["sh", "cargo"]
+
+token_limit = 4096
+max_steps = 16
+timeout_ms = 30000
+
+mandatory_artifacts = ["result.txt"]
+test_commands = ["cargo test"]

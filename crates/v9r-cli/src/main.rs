@@ -13,22 +13,25 @@ use v9r_core::task::{Task, TaskReport};
 use v9r_core::trace::{TaskEvent, TraceLogger};
 use v9r_core::vfs::{checkpoint, register_task, rollback};
 
+mod repl;
+
 #[derive(Debug)]
 enum Command {
     Run(RunArgs),
     Inspect(InspectArgs),
+    Repl,
 }
 
-#[derive(Debug, Default)]
-struct RunArgs {
-    task: Option<String>,
-    manifest: Option<PathBuf>,
-    workdir: Option<PathBuf>,
-    script: Option<PathBuf>,
-    provider: Option<String>,
-    model: Option<String>,
-    base_url: Option<String>,
-    debug_xml: bool,
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RunArgs {
+    pub(crate) task: Option<String>,
+    pub(crate) manifest: Option<PathBuf>,
+    pub(crate) workdir: Option<PathBuf>,
+    pub(crate) script: Option<PathBuf>,
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) debug_xml: bool,
 }
 
 #[derive(Debug, Default)]
@@ -48,10 +51,11 @@ async fn main() -> Result<()> {
     match parse_args(env::args().skip(1).collect())? {
         Command::Run(args) => run(args).await,
         Command::Inspect(args) => inspect(args),
+        Command::Repl => repl::start().await,
     }
 }
 
-async fn run(args: RunArgs) -> Result<()> {
+pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let stdin_is_pipe = !io::stdin().is_terminal();
     let stdout_is_pipe = !io::stdout().is_terminal();
     let task_text = args.task.clone().context("run: missing --task")?;
@@ -258,13 +262,28 @@ async fn run_llm_step(task: &mut Task, trace: &TraceLogger, args: &RunArgs) -> R
 
 fn parse_args(args: Vec<String>) -> Result<Command> {
     let Some(command) = args.first().map(String::as_str) else {
-        return Err(anyhow!(usage()));
+        return Ok(Command::Repl);
     };
     match command {
         "run" => Ok(Command::Run(parse_run_args(&args[1..])?)),
         "inspect" => Ok(Command::Inspect(parse_inspect_args(&args[1..])?)),
+        "repl" => Ok(Command::Repl),
         "help" | "--help" | "-h" => Err(anyhow!(usage())),
-        other => Err(anyhow!("unknown subcommand: {other}\n{}", usage())),
+        other if other.starts_with('-') => Err(anyhow!("unknown argument: {other}\n{}", usage())),
+        _ => Ok(Command::Run(shorthand_run_args(&args))),
+    }
+}
+
+fn shorthand_run_args(args: &[String]) -> RunArgs {
+    RunArgs {
+        task: Some(args.join(" ")),
+        manifest: Some(PathBuf::from("task.toml")),
+        workdir: None,
+        script: None,
+        provider: Some("ollama".to_string()),
+        model: Some("llama3".to_string()),
+        base_url: None,
+        debug_xml: false,
     }
 }
 
@@ -472,5 +491,5 @@ fn log_llm(message: &str) {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  v9r run --task <text> --manifest <path> [--workdir <path>] [--provider <name>] [--model <id>] [--base-url <url>] [-f <script>] [--debug-xml]\n  v9r inspect [--bundle <path>]"
+    "usage:\n  v9r repl\n  v9r \"task description\"\n  v9r run --task <text> --manifest <path> [--workdir <path>] [--provider <name>] [--model <id>] [--base-url <url>] [-f <script>] [--debug-xml]\n  v9r inspect [--bundle <path>]"
 }
