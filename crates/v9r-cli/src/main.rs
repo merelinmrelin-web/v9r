@@ -11,7 +11,7 @@ use v9r_core::execution::{run_task_step, CommandSpec};
 use v9r_core::manifest::{normalize_path, Manifest};
 use v9r_core::task::{Task, TaskReport};
 use v9r_core::trace::{TaskEvent, TraceLogger};
-use v9r_core::vfs::{checkpoint, register_task, rollback};
+use v9r_core::vfs::{checkpoint, ensure_safe_directory, register_task, rollback};
 
 mod repl;
 
@@ -62,6 +62,8 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let manifest_path = args.manifest.clone().context("run: missing --manifest")?;
     let workdir = normalize_path(&args.workdir.clone().unwrap_or(env::current_dir()?));
     let manifest = normalize_manifest_paths(load_manifest(&manifest_path)?, &workdir);
+
+    ensure_safe_directory(&workdir)?;
 
     log_info(&format!(
         "manifest: allow_read={}, allow_write={}, allow_exec={}",
@@ -131,6 +133,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 checkpoint_id.0
             ));
             rollback(task.id, checkpoint_id, &trace).await?;
+            log_warn("rollback completed: original files restored; unrelated pre-existing files preserved");
             task.status = v9r_core::task::TaskStatus::Failed;
             false
         } else {

@@ -42,6 +42,8 @@ pub enum BundleError {
     UnsupportedVersion(u32),
     #[error("unsafe bundle path: {0}")]
     UnsafePath(PathBuf),
+    #[error("{0}")]
+    Safety(String),
     #[error("mandatory artifact missing or empty: {0}")]
     MissingMandatoryArtifact(PathBuf),
     #[error("io at {path}: {source}")]
@@ -83,6 +85,7 @@ pub fn import_bundle(data: &[u8], new_manifest: Manifest, new_workdir: PathBuf) 
     }
 
     let new_workdir = normalize_path(&new_workdir);
+    vfs::ensure_safe_directory(&new_workdir).map_err(|err| BundleError::Safety(err.to_string()))?;
     fs::create_dir_all(&new_workdir).map_err(|source| BundleError::Io {
         path: new_workdir.clone(),
         source,

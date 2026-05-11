@@ -158,6 +158,9 @@ impl ReplSession {
             .manifest_path
             .clone()
             .ok_or_else(|| anyhow!("run: no manifest loaded"))?;
+        eprintln!(
+            "[INFO] rollback policy: restore modified files from .v9r/backups; delete only files created during this transaction"
+        );
         run(RunArgs {
             task: Some(task),
             manifest: Some(manifest),
@@ -168,7 +171,9 @@ impl ReplSession {
             base_url: self.base_url.clone(),
             debug_xml: self.debug_xml,
         })
-        .await
+        .await?;
+        eprintln!("[INFO] rollback policy: original pre-existing files preserved");
+        Ok(())
     }
 
     fn print_status(&self) {
