@@ -29,7 +29,7 @@ No partial success. No silent state drift. No unbounded execution.
 To use `v9r` as a global command, install it via Cargo:
 
 ```bash
-git clone [https://github.com/merelinmrelin-web/v9r](https://github.com/merelinmrelin-web/v9r)
+git clone [https://github.com/ph0xphene/v9r](https://github.com/ph0xphene/v9r)
 cd v9r
 cargo install --path crates/v9r-cli
 ```
