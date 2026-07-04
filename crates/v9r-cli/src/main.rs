@@ -72,21 +72,24 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         format_strings(&manifest.allow_exec)
     ));
 
+    // Non-TTY stdin is not proof that a bundle is being piped in: CI
+    // runners, cron, and scripted invocations all hand us a non-terminal
+    // (often empty) stdin. Only treat it as a handoff if bytes actually
+    // arrive; an empty stdin starts a fresh task.
     let mut imported_bundle = None;
     if stdin_is_pipe {
-        log_info("stdin is a pipe: importing task bundle...");
         let mut data = Vec::new();
         io::stdin().read_to_end(&mut data)?;
-        if data.is_empty() {
-            return Err(anyhow!("stdin pipe contained no task bundle"));
+        if !data.is_empty() {
+            log_info("stdin contained data: importing task bundle...");
+            let bundle = decode_bundle(&data)?;
+            log_info(&format!(
+                "bundle loaded: source_task_id={}, files={}",
+                bundle.source_task_id,
+                bundle.files.len()
+            ));
+            imported_bundle = Some(data);
         }
-        let bundle = decode_bundle(&data)?;
-        log_info(&format!(
-            "bundle loaded: source_task_id={}, files={}",
-            bundle.source_task_id,
-            bundle.files.len()
-        ));
-        imported_bundle = Some(data);
     }
 
     fs::create_dir_all(&workdir)
@@ -95,6 +98,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     fs::write(workdir.join("task.txt"), task_text)
         .with_context(|| format!("write task file: {}", workdir.join("task.txt").display()))?;
 
+    let imported = imported_bundle.is_some();
     let mut task = if let Some(data) = imported_bundle {
         Task::from_bundle(&data, manifest, workdir.clone())?
     } else {
@@ -105,7 +109,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     log_info(&format!("task started: task_id={}", task.id));
 
     let trace = TraceLogger::new(workdir.join("trace.jsonl")).await?;
-    if !stdin_is_pipe {
+    if !imported {
         trace
             .log_event(TaskEvent::task_started(task.manifest.clone()))
             .await?;
