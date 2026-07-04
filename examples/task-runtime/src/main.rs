@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use v9r_core::execution::{run_task_step, CommandSpec};
+use v9r_core::execution::{run_task_step, run_trusted_script, CommandSpec};
 use v9r_core::manifest::Manifest;
 use v9r_core::task::Task;
 use v9r_core::trace::{TaskEvent, TraceLogger};
@@ -55,18 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = checkpoint(task.id, &trace).await?;
     report(export_bundle, &format!("checkpoint: {}", checkpoint.0));
 
-    run_task_step(
-        &mut task,
-        CommandSpec {
-            program: "sh".to_string(),
-            args: vec!["-c".to_string(), "printf 'dirty\n' > state.txt".to_string()],
-            cwd: Some(workdir.clone()),
-            reads: Vec::new(),
-            writes: vec![PathBuf::from("state.txt")],
-        },
-        &trace,
-    )
-    .await?;
+    // Operator-supplied scripts are the one sanctioned shell entry point
+    // (`sh` must be in allow_exec). Model-issued commands can never reach
+    // a shell — see the denied step below.
+    let script = root.join("make-dirty.sh");
+    fs::write(&script, "printf 'dirty\\n' > state.txt\n")?;
+    run_trusted_script(&mut task, &script, &trace).await?;
     report(
         export_bundle,
         &format!("after allowed write: {:?}", task.status),
@@ -76,16 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &format!("state: {}", fs::read_to_string(workdir.join("state.txt"))?),
     );
 
+    // A direct command (no shell) trying to escape the workdir: the
+    // structural fence rejects the parent-traversal argument before the
+    // manifest is even consulted, and the task is marked as a violation.
     let bad_write = run_task_step(
         &mut task,
         CommandSpec {
-            program: "sh".to_string(),
-            args: vec![
-                "-c".to_string(),
-                "printf 'escaped\n' > ../escape.txt".to_string(),
-            ],
+            program: "cp".to_string(),
+            args: vec!["state.txt".to_string(), "../escape.txt".to_string()],
             cwd: Some(workdir.clone()),
-            reads: Vec::new(),
+            reads: vec![PathBuf::from("state.txt")],
             writes: vec![PathBuf::from("../escape.txt")],
         },
         &trace,
