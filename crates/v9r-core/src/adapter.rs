@@ -19,7 +19,7 @@ const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_MODEL_ID: &str = "google/gemini-flash-1.5";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 const OLLAMA_MODEL_ID: &str = "llama3";
-const HTTP_REFERER: &str = "https://github.com/nikita/v9r";
+const HTTP_REFERER: &str = "https://github.com/ph0xphene/v9r";
 const X_TITLE: &str = "v9r Orchestrator";
 const SNAPSHOT_HISTORY_LIMIT: usize = 32;
 
