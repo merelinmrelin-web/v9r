@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use tracing_subscriber::EnvFilter;
 use v9r_core::adapter::{LlmClient, ProviderKind};
 use v9r_core::bundle::TaskBundle;
-use v9r_core::execution::{run_task_step, CommandSpec};
+use v9r_core::execution::run_trusted_script;
 use v9r_core::manifest::{normalize_path, Manifest};
 use v9r_core::task::{Task, TaskReport};
 use v9r_core::trace::{TaskEvent, TraceLogger};
@@ -229,23 +229,19 @@ fn inspect(args: InspectArgs) -> Result<()> {
 
 async fn run_script(task: &mut Task, trace: &TraceLogger, script: &Path) -> Result<()> {
     let script = normalize_path(script);
-    let content = fs::read_to_string(&script)
-        .with_context(|| format!("read script: {}", script.display()))?;
+    if !script.is_file() {
+        return Err(anyhow!("script not found: {}", script.display()));
+    }
     log_exec(&format!("script: {}", script.display()));
-    let output = run_task_step(
-        task,
-        CommandSpec {
-            program: "sh".to_string(),
-            args: vec!["-c".to_string(), content],
-            cwd: Some(task.workdir.clone()),
-            reads: Vec::new(),
-            writes: Vec::new(),
-        },
-        trace,
-    )
-    .await?;
+    let output = run_trusted_script(task, &script, trace).await?;
     emit_exec_output("stdout", &output.stdout);
     emit_exec_output("stderr", &output.stderr);
+    if output.status_code != Some(0) {
+        return Err(anyhow!(
+            "script exited with code {}",
+            output.status_code.unwrap_or(-1)
+        ));
+    }
     Ok(())
 }
 

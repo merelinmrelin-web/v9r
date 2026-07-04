@@ -78,14 +78,77 @@ pub async fn run_task_step(
     let cwd = command_cwd(task, &command);
     let program = command.program.clone();
     let args = command.args.clone();
+    let rendered_command = command_line(&command);
+    spawn_and_record(task, trace, &program, &args, &cwd, rendered_command).await
+}
 
-    let output = Command::new(&program)
+/// Operator-supplied script execution (`v9r run -f script.sh`). This is
+/// the single sanctioned shell entry point: the script file is named on
+/// the CLI by the operator, never by model output, so the structural
+/// fence on LLM commands (`validate_command_spec`) does not apply here.
+/// The manifest contract still holds — `sh` must be in `allow_exec`, and
+/// step/block accounting is identical to `run_task_step`.
+pub async fn run_trusted_script(
+    task: &mut Task,
+    script: &Path,
+    trace: &TraceLogger,
+) -> Result<StepOutput> {
+    vfs::register_task(task.id, task.workdir.clone());
+    task.record_tool_call()
+        .map_err(|_| ExecutionError::MaxStepsExceeded(task.manifest.max_steps))?;
+    if let Err(err) = vfs::ensure_task_fs_unblocked(task.id) {
+        task.status = TaskStatus::Violation;
+        trace
+            .log_event(TaskEvent::ViolationOccurred {
+                reason: err.to_string(),
+            })
+            .await?;
+        return Err(err.into());
+    }
+
+    let exec_path = PathBuf::from("sh");
+    let allowed = task.manifest.is_allowed(&exec_path, AccessType::Exec);
+    trace
+        .log_event(TaskEvent::FileAccess {
+            path: exec_path,
+            access: AccessType::Exec,
+            allowed,
+        })
+        .await?;
+    if !allowed {
+        return deny_task(
+            task,
+            trace,
+            "exec denied: script mode requires `sh` in allow_exec".to_string(),
+        )
+        .await;
+    }
+
+    task.status = TaskStatus::Running;
+    let cwd = normalize_path(&task.workdir);
+    let args = vec![script.display().to_string()];
+    let rendered_command = format!("sh {}", script.display());
+    spawn_and_record(task, trace, "sh", &args, &cwd, rendered_command).await
+}
+
+async fn spawn_and_record(
+    task: &mut Task,
+    trace: &TraceLogger,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    rendered_command: String,
+) -> Result<StepOutput> {
+    let output = Command::new(program)
         .args(args)
         .current_dir(cwd)
         .kill_on_drop(true)
         .output()
         .await
-        .map_err(|source| ExecutionError::Io { program, source })?;
+        .map_err(|source| ExecutionError::Io {
+            program: program.to_string(),
+            source,
+        })?;
 
     task.status = TaskStatus::Verifying;
     let step_output = StepOutput {
@@ -93,7 +156,6 @@ pub async fn run_task_step(
         stdout: output.stdout,
         stderr: output.stderr,
     };
-    let rendered_command = command_line(&command);
     let exit_code = step_output.status_code.unwrap_or(-1);
     task.record_test_command(&rendered_command, exit_code);
     trace
