@@ -86,6 +86,8 @@ pub enum LlmAction {
 pub enum AdapterError {
     #[error("max_steps exceeded: {0}")]
     MaxStepsExceeded(usize),
+    #[error("token_limit exceeded: used ~{used} of {limit}")]
+    TokenLimitExceeded { used: u64, limit: u32 },
     #[error("V9R_API_KEY not set")]
     MissingApiKey,
     #[error("http client: {0}")]
@@ -352,6 +354,16 @@ impl Task {
                         )
                         .await;
                 }
+                Ok(Err(err)) if is_token_limit_error(&err) => {
+                    return self
+                        .rollback_report(
+                            snapshot,
+                            trace,
+                            TaskErrorType::TokenLimitExceeded,
+                            err.to_string(),
+                        )
+                        .await;
+                }
                 Ok(Err(err)) => {
                     return self
                         .rollback_report(
@@ -378,7 +390,7 @@ impl Task {
         let finished_status = self.status;
         self.status = TaskStatus::Verifying;
         tracing::info!(task_id = %self.id, "validating task outcome");
-        match self.validate_outcome().await {
+        match self.validate_outcome(trace).await {
             Ok(artifact_hashes) => {
                 self.status = match finished_status {
                     TaskStatus::Failed => TaskStatus::Failed,
@@ -408,7 +420,12 @@ impl Task {
     pub async fn step(&mut self, client: &LlmClient, trace: &TraceLogger) -> Result<()> {
         let snapshot = self.xml_snapshot(trace, SNAPSHOT_HISTORY_LIMIT).await?;
         let prompt = format!("{SYSTEM_PROMPT}\n\n{snapshot}");
+        // Charge the prompt against the budget BEFORE the request goes
+        // out, so a context that has outgrown the limit halts the task
+        // instead of spending provider quota first.
+        self.charge_tokens(estimate_tokens(&prompt))?;
         let response = client.complete(prompt).await?;
+        self.charge_tokens(estimate_tokens(&response))?;
         let actions = parse_actions(&response)?;
         if actions.is_empty() {
             return Err(AdapterError::InvalidAction(
@@ -455,7 +472,7 @@ impl Task {
         Ok(())
     }
 
-    pub async fn validate_outcome(&self) -> anyhow::Result<Vec<ArtifactHash>> {
+    pub async fn validate_outcome(&self, trace: &TraceLogger) -> anyhow::Result<Vec<ArtifactHash>> {
         for artifact in &self.manifest.mandatory_artifacts {
             let path = resolve_task_path(&self.workdir, artifact);
             let metadata = tokio::fs::metadata(&path)
@@ -474,7 +491,60 @@ impl Task {
             );
         }
 
+        // The runtime runs every configured test command itself, against
+        // the final workdir state. Whether the agent chose to run them
+        // mid-task is irrelevant to the guarantee — "test commands exit 0"
+        // is verified here, at the task boundary, and a failure routes to
+        // rollback in the caller.
+        for command in &self.manifest.test_commands {
+            let rendered = command.trim();
+            if rendered.is_empty() {
+                continue;
+            }
+            let mut tokens = rendered.split_whitespace();
+            let program = tokens
+                .next()
+                .with_context(|| format!("empty test command: {command:?}"))?;
+            let output = tokio::time::timeout(
+                Duration::from_millis(self.manifest.timeout_ms),
+                tokio::process::Command::new(program)
+                    .args(tokens)
+                    .current_dir(normalize_path(&self.workdir))
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "test command timed out after {}ms: {rendered}",
+                    self.manifest.timeout_ms
+                )
+            })?
+            .with_context(|| format!("test command failed to start: {rendered}"))?;
+            let exit_code = output.status.code().unwrap_or(-1);
+            trace
+                .log_event(TaskEvent::CommandExecuted {
+                    command: format!("validate: {rendered}"),
+                    exit_code,
+                })
+                .await?;
+            if exit_code != 0 {
+                anyhow::bail!("test command failed: {rendered} exit_code={exit_code}");
+            }
+        }
+
         compute_mandatory_artifact_hashes(self).map_err(Into::into)
+    }
+
+    fn charge_tokens(&mut self, amount: u64) -> Result<()> {
+        self.tokens_used = self.tokens_used.saturating_add(amount);
+        if self.tokens_used > u64::from(self.manifest.token_limit) {
+            return Err(AdapterError::TokenLimitExceeded {
+                used: self.tokens_used,
+                limit: self.manifest.token_limit,
+            });
+        }
+        Ok(())
     }
 
     fn report(
@@ -899,6 +969,18 @@ fn is_max_steps_error(err: &AdapterError) -> bool {
     )
 }
 
+fn is_token_limit_error(err: &AdapterError) -> bool {
+    matches!(err, AdapterError::TokenLimitExceeded { .. })
+}
+
+/// Crude byte-based token estimate (~4 bytes per token for typical
+/// English/code text). The runtime talks to arbitrary providers and has
+/// no tokenizer, so the manifest budget is enforced on this
+/// approximation rather than exact counts.
+fn estimate_tokens(text: &str) -> u64 {
+    (text.len() as u64).div_ceil(4)
+}
+
 fn attr_value(tag: &str, name: &str) -> Option<String> {
     let needle = format!("{name}=\"");
     let start = tag.find(&needle)? + needle.len();
@@ -1097,6 +1179,62 @@ mod tests {
         std::fs::write(&dst, b"old content").unwrap();
         write_atomic_to(&dst, b"new content").await.unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"new content");
+    }
+
+    // -------- token budget --------
+
+    fn small_manifest(workdir: &Path, token_limit: u32, test_commands: Vec<String>) -> crate::manifest::Manifest {
+        crate::manifest::Manifest {
+            allow_read: vec![workdir.to_path_buf()],
+            allow_write: vec![workdir.to_path_buf()],
+            allow_exec: Vec::new(),
+            token_limit,
+            max_steps: 8,
+            timeout_ms: 30_000,
+            mandatory_artifacts: Vec::new(),
+            test_commands,
+        }
+    }
+
+    #[test]
+    fn charge_tokens_halts_once_budget_is_spent() {
+        let dir = temp_dir("tokens");
+        let mut task = Task::new(small_manifest(&dir, 10, Vec::new()), dir);
+
+        task.charge_tokens(6).unwrap();
+        task.charge_tokens(4).unwrap();
+        let err = task.charge_tokens(1).unwrap_err();
+        assert!(
+            matches!(err, AdapterError::TokenLimitExceeded { used: 11, limit: 10 }),
+            "{err}"
+        );
+        assert!(is_token_limit_error(&err));
+    }
+
+    #[test]
+    fn estimate_tokens_rounds_up() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abc"), 1);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    // -------- runtime-enforced test commands --------
+
+    #[tokio::test]
+    async fn validate_outcome_runs_test_commands_itself() {
+        let dir = temp_dir("validate-tests");
+        let trace = TraceLogger::new(dir.join("trace.jsonl")).await.unwrap();
+
+        // A failing test command must fail validation even though the
+        // agent never ran it (ran_test_command stays false).
+        let task = Task::new(small_manifest(&dir, 100, vec!["false".to_string()]), dir.clone());
+        let err = task.validate_outcome(&trace).await.unwrap_err();
+        assert!(err.to_string().contains("test command failed"), "{err}");
+
+        // A passing test command validates.
+        let task = Task::new(small_manifest(&dir, 100, vec!["true".to_string()]), dir);
+        task.validate_outcome(&trace).await.unwrap();
     }
 
     #[tokio::test]

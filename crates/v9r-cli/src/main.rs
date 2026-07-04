@@ -120,7 +120,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         log_info(&format!("checkpoint created: id={}", checkpoint_id.0));
         let run_result = match run_script(&mut task, &trace, &script).await {
             Ok(()) => task
-                .validate_outcome()
+                .validate_outcome(&trace)
                 .await
                 .map(|_| ())
                 .map_err(Into::into),
