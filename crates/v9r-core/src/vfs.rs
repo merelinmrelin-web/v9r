@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::trace::{TaskEvent, TraceLogger};
 
-const V9R_DIR: &str = ".v9r";
+pub(crate) const V9R_DIR: &str = ".v9r";
 const BACKUPS_DIR: &str = "backups";
 const SNAPSHOT_MANIFEST: &str = "manifest.json";
 const SAFETY_ERROR: &str = "Safety Error: Cannot use a project root (or a subfolder of one) as a mutable workdir. Place the workdir somewhere outside any version-controlled tree, or opt in by creating a `.v9r-workdir` file inside it.";
@@ -33,8 +33,8 @@ const PROJECT_MARKERS: &[&str] = &[
 
 /// Presence of this file at the workdir's top level means the user has
 /// explicitly opted in: "yes, manage this directory as an agent workdir,
-/// even though an ancestor is a project root." Without it we refuse to
-/// rollback inside any version-controlled tree.
+/// even though it is (or sits inside) a project root." Without it we
+/// refuse to rollback inside any version-controlled tree.
 const OPT_IN_MARKER: &str = ".v9r-workdir";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -110,21 +110,21 @@ fn ancestor_has_marker(dir: &Path) -> bool {
 }
 
 /// A directory is safe to use as a mutable agent workdir when:
-///   1. It does NOT itself contain a project-root marker (.git, Cargo.toml, etc.)
-///   2. AND either no ancestor contains a marker, OR the workdir contains
-///      the explicit opt-in file `.v9r-workdir`.
+///   1. It contains the explicit opt-in file `.v9r-workdir` — the user
+///      has said "yes, manage this directory as an agent workdir," and
+///      that consent covers project roots themselves (the whole point of
+///      checkpoint/rollback is making that safe);
+///   2. OR neither it nor any ancestor contains a project-root marker
+///      (.git, Cargo.toml, etc.).
 ///
-/// Rule (2) is the one that catches the "agent is rooted at a subfolder
-/// inside my git repo" footgun. The opt-in is a file the user creates
-/// when they really do want the agent operating inside their repo.
+/// The fence is "refuse unless opted in," not an absolute block: without
+/// the marker we refuse project roots and their subfolders, which catches
+/// the "agent is rooted inside my repo without me realizing" footgun.
 pub fn is_safe_directory(workdir: &Path) -> bool {
-    if has_marker_at(workdir) {
-        return false;
-    }
     if workdir.join(OPT_IN_MARKER).is_file() {
         return true;
     }
-    !ancestor_has_marker(workdir)
+    !has_marker_at(workdir) && !ancestor_has_marker(workdir)
 }
 
 pub fn ensure_safe_directory(workdir: &Path) -> Result<()> {
@@ -599,6 +599,19 @@ mod tests {
             fs::write(dir.join(marker), b"x").unwrap();
             assert!(!is_safe_directory(&dir), "{marker} should mark a root");
         }
+    }
+
+    #[test]
+    fn accepts_project_root_with_explicit_opt_in() {
+        // The fence is "refuse unless opted in": a project root becomes a
+        // valid workdir once the user drops the marker file in it.
+        let dir = temp_dir("optin-root");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert!(!is_safe_directory(&dir));
+
+        fs::write(dir.join(OPT_IN_MARKER), b"").unwrap();
+        assert!(is_safe_directory(&dir));
     }
 
     #[test]

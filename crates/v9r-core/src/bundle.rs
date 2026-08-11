@@ -159,6 +159,21 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<BundleFile>) -> Result<(
         if metadata.file_type().is_symlink() {
             continue;
         }
+        let relative_path = path
+            .strip_prefix(root)
+            .map_err(|_| BundleError::UnsafePath(path.clone()))?
+            .to_path_buf();
+        // `.v9r/` holds checkpoint backups — runtime-internal state, same
+        // exclusion the checkpoint and rollback walkers apply. Shipping it
+        // would put a full duplicate of the workdir in every bundle and
+        // compound across chained tasks.
+        if relative_path
+            .components()
+            .next()
+            .is_some_and(|component| component.as_os_str() == vfs::V9R_DIR)
+        {
+            continue;
+        }
         if metadata.is_dir() {
             collect_files(root, &path, out)?;
             continue;
@@ -167,10 +182,6 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<BundleFile>) -> Result<(
             if path.file_name().is_some_and(|name| name == TRACE_FILE_NAME) {
                 continue;
             }
-            let relative_path = path
-                .strip_prefix(root)
-                .map_err(|_| BundleError::UnsafePath(path.clone()))?
-                .to_path_buf();
             let bytes = fs::read(&path).map_err(|source| BundleError::Io { path, source })?;
             out.push(BundleFile {
                 relative_path,
@@ -258,5 +269,39 @@ mod tests {
     fn rejects_parent_dir_paths() {
         assert!(safe_relative_path(Path::new("../escape.txt")).is_err());
         assert!(safe_relative_path(Path::new("ok/file.txt")).is_ok());
+    }
+
+    #[test]
+    fn export_excludes_v9r_backups() {
+        let workdir =
+            std::env::temp_dir().join(format!("v9r-bundle-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(workdir.join(".v9r/backups/task/checkpoint")).unwrap();
+        fs::write(
+            workdir.join(".v9r/backups/task/checkpoint/old.txt"),
+            b"backup copy",
+        )
+        .unwrap();
+        fs::write(workdir.join("result.txt"), b"payload").unwrap();
+
+        let manifest = Manifest {
+            allow_read: vec![workdir.clone()],
+            allow_write: vec![workdir.clone()],
+            allow_exec: Vec::new(),
+            token_limit: 100,
+            max_steps: 8,
+            timeout_ms: 30_000,
+            mandatory_artifacts: Vec::new(),
+            test_commands: Vec::new(),
+        };
+        let task = Task::new(manifest, workdir);
+
+        let data = export_bundle(&task, None).unwrap();
+        let bundle: TaskBundle = bincode::deserialize(&data).unwrap();
+        let paths: Vec<_> = bundle
+            .files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect();
+        assert_eq!(paths, vec![PathBuf::from("result.txt")], "{paths:?}");
     }
 }

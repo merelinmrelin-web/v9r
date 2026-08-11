@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use tracing_subscriber::EnvFilter;
 use v9r_core::adapter::{LlmClient, ProviderKind};
 use v9r_core::bundle::TaskBundle;
-use v9r_core::execution::{run_task_step, CommandSpec};
+use v9r_core::execution::run_trusted_script;
 use v9r_core::manifest::{normalize_path, Manifest};
 use v9r_core::task::{Task, TaskReport};
 use v9r_core::trace::{TaskEvent, TraceLogger};
@@ -72,21 +72,24 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         format_strings(&manifest.allow_exec)
     ));
 
+    // Non-TTY stdin is not proof that a bundle is being piped in: CI
+    // runners, cron, and scripted invocations all hand us a non-terminal
+    // (often empty) stdin. Only treat it as a handoff if bytes actually
+    // arrive; an empty stdin starts a fresh task.
     let mut imported_bundle = None;
     if stdin_is_pipe {
-        log_info("stdin is a pipe: importing task bundle...");
         let mut data = Vec::new();
         io::stdin().read_to_end(&mut data)?;
-        if data.is_empty() {
-            return Err(anyhow!("stdin pipe contained no task bundle"));
+        if !data.is_empty() {
+            log_info("stdin contained data: importing task bundle...");
+            let bundle = decode_bundle(&data)?;
+            log_info(&format!(
+                "bundle loaded: source_task_id={}, files={}",
+                bundle.source_task_id,
+                bundle.files.len()
+            ));
+            imported_bundle = Some(data);
         }
-        let bundle = decode_bundle(&data)?;
-        log_info(&format!(
-            "bundle loaded: source_task_id={}, files={}",
-            bundle.source_task_id,
-            bundle.files.len()
-        ));
-        imported_bundle = Some(data);
     }
 
     fs::create_dir_all(&workdir)
@@ -95,6 +98,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     fs::write(workdir.join("task.txt"), task_text)
         .with_context(|| format!("write task file: {}", workdir.join("task.txt").display()))?;
 
+    let imported = imported_bundle.is_some();
     let mut task = if let Some(data) = imported_bundle {
         Task::from_bundle(&data, manifest, workdir.clone())?
     } else {
@@ -105,7 +109,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     log_info(&format!("task started: task_id={}", task.id));
 
     let trace = TraceLogger::new(workdir.join("trace.jsonl")).await?;
-    if !stdin_is_pipe {
+    if !imported {
         trace
             .log_event(TaskEvent::task_started(task.manifest.clone()))
             .await?;
@@ -120,7 +124,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         log_info(&format!("checkpoint created: id={}", checkpoint_id.0));
         let run_result = match run_script(&mut task, &trace, &script).await {
             Ok(()) => task
-                .validate_outcome()
+                .validate_outcome(&trace)
                 .await
                 .map(|_| ())
                 .map_err(Into::into),
@@ -229,23 +233,19 @@ fn inspect(args: InspectArgs) -> Result<()> {
 
 async fn run_script(task: &mut Task, trace: &TraceLogger, script: &Path) -> Result<()> {
     let script = normalize_path(script);
-    let content = fs::read_to_string(&script)
-        .with_context(|| format!("read script: {}", script.display()))?;
+    if !script.is_file() {
+        return Err(anyhow!("script not found: {}", script.display()));
+    }
     log_exec(&format!("script: {}", script.display()));
-    let output = run_task_step(
-        task,
-        CommandSpec {
-            program: "sh".to_string(),
-            args: vec!["-c".to_string(), content],
-            cwd: Some(task.workdir.clone()),
-            reads: Vec::new(),
-            writes: Vec::new(),
-        },
-        trace,
-    )
-    .await?;
+    let output = run_trusted_script(task, &script, trace).await?;
     emit_exec_output("stdout", &output.stdout);
     emit_exec_output("stderr", &output.stderr);
+    if output.status_code != Some(0) {
+        return Err(anyhow!(
+            "script exited with code {}",
+            output.status_code.unwrap_or(-1)
+        ));
+    }
     Ok(())
 }
 

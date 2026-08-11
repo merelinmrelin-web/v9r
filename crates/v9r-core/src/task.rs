@@ -25,6 +25,8 @@ pub struct Task {
     pub workdir: PathBuf,
     pub status: TaskStatus,
     pub steps_used: usize,
+    #[serde(default)]
+    pub tokens_used: u64,
     pub ran_test_command: bool,
     pub last_test_exit_code: Option<i32>,
 }
@@ -34,6 +36,7 @@ pub enum TaskErrorType {
     ValidationFailed,
     SecurityViolation,
     MaxStepsExceeded,
+    TokenLimitExceeded,
     Timeout,
     ExecutionFailed,
     RollbackFailed,
@@ -57,6 +60,7 @@ impl Task {
             workdir,
             status: TaskStatus::Idle,
             steps_used: 0,
+            tokens_used: 0,
             ran_test_command: false,
             last_test_exit_code: None,
         }

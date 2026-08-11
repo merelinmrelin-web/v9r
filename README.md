@@ -29,7 +29,7 @@ No partial success. No silent state drift. No unbounded execution.
 To use `v9r` as a global command, install it via Cargo:
 
 ```bash
-git clone [https://github.com/ph0xphene/v9r](https://github.com/ph0xphene/v9r)
+git clone https://github.com/ph0xphene/v9r
 cd v9r
 cargo install --path crates/v9r-cli
 ```
@@ -55,6 +55,14 @@ timeout_ms = 30000
 
 mandatory_artifacts = ["result.txt"]
 test_commands = ["cargo test"]
+```
+
+If the workdir is a project root (contains `.git`, `Cargo.toml`, `package.json`, ...)
+or sits inside one, opt in explicitly — v9r refuses to manage project trees it
+has not been given consent for:
+
+```sh
+touch .v9r-workdir
 ```
 
 Start the transactional shell:
@@ -139,6 +147,11 @@ v9r run \
   -f ./task.sh
 ```
 
+Script mode runs the operator-supplied file via `sh <file>` and requires `sh`
+in the manifest's `allow_exec`. This is the single sanctioned shell entry
+point: model-issued `<execute>` commands can never invoke a shell, regardless
+of the manifest. A non-zero script exit triggers rollback.
+
 Inspect a bundle:
 
 ```sh
@@ -161,8 +174,10 @@ v9r validates:
 
 - mandatory artifacts exist
 - mandatory artifacts are non-empty
-- configured test commands exit with `0`
-- execution stayed within step and wall-clock bounds
+- configured test commands exit with `0` — the runtime executes them itself
+  against the final workdir state at the task boundary, whether or not the
+  agent ran them mid-task
+- execution stayed within step, token, and wall-clock bounds
 
 ### Portability
 
@@ -194,6 +209,11 @@ test_commands = ["cargo test"]
 
 The manifest is the contract. The runtime enforces it.
 
+`token_limit` is enforced on a byte-based estimate (~4 bytes per token),
+charged for each prompt before the request is sent and each response after;
+exceeding the budget halts the task and rolls back. `max_steps` counts every
+execute/write action, and `timeout_ms` bounds the whole transaction.
+
 ## Canonical Demos
 
 | Use case | Command shape | Guarantee |
@@ -212,7 +232,10 @@ v9r inspect --bundle audit.bundle
 v9r run --task "fix" --manifest fix.toml --workdir /tmp/fix < audit.bundle > fix.bundle
 ```
 
-If `stdin` is a pipe, `v9r run` imports a bundle. If `stdout` is a pipe, it writes a binary bundle. If `stdout` is a terminal, it prints a compact summary.
+If `stdin` is a pipe that delivers data, `v9r run` imports it as a bundle; an
+empty stdin (CI, cron, `< /dev/null`) starts a fresh task. If `stdout` is a
+pipe, it writes a binary bundle. If `stdout` is a terminal, it prints a
+compact summary.
 
 ## Providers
 
